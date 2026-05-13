@@ -1,23 +1,40 @@
 const BRAIN_BASE = "https://jim-brain-production.up.railway.app";
-const SESSION_TAG_RE = /^(CC-[A-Z0-9-]+_[a-f0-9]{4,}|session_[a-z0-9]{3,})$/i;
-const PHASE_TAG_RE = /^(phase_[a-z0-9_-]+|spawn|discovery|complete|done|verify|deploy)$/i;
+const CC_SESSION_RE = /^CC-[A-Z0-9-]+_[a-f0-9]{4,}$/i;
+const HEX_SESSION_RE = /^session_[a-f0-9]{6,}$/i;
+const NAMED_SESSION_RE = /^session_[a-z][a-z0-9]{2,}$/i;
+const LIFECYCLE_WORDS = new Set([
+  "partial", "completed", "complete", "start", "close", "end", "done",
+  "pass", "fail", "failed", "success", "error", "blocker", "blocked",
+  "halt", "fatal", "spawn", "ready", "begin",
+]);
+const PHASE_TAG_RE = /^(phase_[a-z0-9_-]+|spawn|discovery|verify|deploy)$/i;
 const STATUS_TAGS = {
-  pass: ["complete", "done", "success", "pass"],
-  fail: ["fail", "fatal", "blocker", "blocked", "halt", "error"],
+  pass: ["complete", "done", "success", "pass", "shipped"],
+  fail: ["fail", "failed", "fatal", "blocker", "blocked", "halt", "error"],
 };
 
-function classify(tags, content) {
+function isSessionTag(tag) {
+  if (CC_SESSION_RE.test(tag)) return true;
+  if (HEX_SESSION_RE.test(tag)) return true;
+  if (NAMED_SESSION_RE.test(tag)) {
+    const word = tag.slice("session_".length).toLowerCase();
+    if (LIFECYCLE_WORDS.has(word)) return false;
+    return true;
+  }
+  return false;
+}
+
+function classify(tags) {
   const lower = tags.map((t) => String(t).toLowerCase());
   for (const t of lower) if (STATUS_TAGS.fail.includes(t)) return "FAIL";
   for (const t of lower) if (STATUS_TAGS.pass.includes(t)) return "PASS";
-  const c = (content || "").toLowerCase();
-  if (/\bfail(ed)?\b|\berror\b|\bblocked\b/.test(c)) return "FAIL";
-  if (/\bcomplete[d]?\b|\bdone\b|\bshipped\b|\bpass\b/.test(c)) return "PASS";
   return "RUNNING";
 }
 
 function extractSessionId(tags) {
-  for (const t of tags) if (SESSION_TAG_RE.test(t)) return t;
+  for (const t of tags) if (CC_SESSION_RE.test(t)) return t;
+  for (const t of tags) if (HEX_SESSION_RE.test(t)) return t;
+  for (const t of tags) if (isSessionTag(t)) return t;
   return null;
 }
 
@@ -89,11 +106,17 @@ export async function onRequestGet({ request, env }) {
       }
       s.entry_count += 1;
       for (const t of tags) s.all_tags.add(t);
+      const entryStatus = classify(tags);
+      if (entryStatus !== "RUNNING") {
+        if (!s.latest_status_ts || ts > s.latest_status_ts) {
+          s.status_guess = entryStatus;
+          s.latest_status_ts = ts;
+        }
+      }
       if (!s.latest_timestamp || ts > new Date(s.latest_timestamp).getTime()) {
         s.latest_timestamp = log.logged_at;
         s.latest_content_preview = (log.content || "").slice(0, 240);
         s.latest_phase_tag = extractPhase(tags) || s.latest_phase_tag;
-        s.status_guess = classify(tags, log.content);
       }
     }
     const out = Array.from(sessions.values())
