@@ -31,8 +31,13 @@ export async function onRequestGet({ request, env, params }) {
     }
     const data = await upstream.json();
     const logs = data.logs || [];
+    const sidLower = sessionId.toLowerCase();
     const entries = logs
-      .filter((l) => (l.tags || []).includes(sessionId))
+      .filter((l) => {
+        const tagMatch = (l.tags || []).some((t) => String(t).toLowerCase() === sidLower);
+        if (tagMatch) return true;
+        return l.content && String(l.content).toLowerCase().includes(sidLower);
+      })
       .map((l) => ({
         id: l.id,
         content: l.content,

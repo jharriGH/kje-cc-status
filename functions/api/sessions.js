@@ -24,17 +24,27 @@ function isSessionTag(tag) {
   return false;
 }
 
-function classify(tags) {
+function classify(tags, content) {
   const lower = tags.map((t) => String(t).toLowerCase());
   for (const t of lower) if (STATUS_TAGS.fail.includes(t)) return "FAIL";
   for (const t of lower) if (STATUS_TAGS.pass.includes(t)) return "PASS";
+  const c = content ? String(content) : "";
+  const rcMatch = c.match(/\(rc=(-?\d+)/);
+  if (rcMatch) return rcMatch[1] === "0" ? "PASS" : "FAIL";
+  if (/session_completed/i.test(lower.join(" ")) && /completed/i.test(c)) return "PASS";
   return "RUNNING";
 }
 
-function extractSessionId(tags) {
+const CC_CONTENT_RE = /CC-[A-Z0-9-]+_[a-f0-9]{6,}/gi;
+
+function extractSessionId(tags, content) {
   for (const t of tags) if (CC_SESSION_RE.test(t)) return t;
   for (const t of tags) if (HEX_SESSION_RE.test(t)) return t;
   for (const t of tags) if (isSessionTag(t)) return t;
+  if (content) {
+    const m = String(content).match(CC_CONTENT_RE);
+    if (m && m[0]) return m[0];
+  }
   return null;
 }
 
@@ -85,7 +95,7 @@ export async function onRequestGet({ request, env }) {
     const sessions = new Map();
     for (const log of logs) {
       const tags = log.tags || [];
-      const sid = extractSessionId(tags);
+      const sid = extractSessionId(tags, log.content);
       if (!sid) continue;
       const ts = log.logged_at ? new Date(log.logged_at).getTime() : 0;
       if (ts && ts < cutoff) continue;
@@ -106,7 +116,7 @@ export async function onRequestGet({ request, env }) {
       }
       s.entry_count += 1;
       for (const t of tags) s.all_tags.add(t);
-      const entryStatus = classify(tags);
+      const entryStatus = classify(tags, log.content);
       if (entryStatus !== "RUNNING") {
         if (!s.latest_status_ts || ts > s.latest_status_ts) {
           s.status_guess = entryStatus;
