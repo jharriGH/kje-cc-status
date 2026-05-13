@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="theme-color" content="#0f172a" />
+    <title>KJE CC Session Status</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+      .skeleton { background: linear-gradient(90deg,#1e293b 0%,#334155 50%,#1e293b 100%); background-size: 200% 100%; animation: shimmer 1.4s linear infinite; }
+      @keyframes shimmer { 0%{background-position:200% 0} 100%{background-position:-200% 0} }
+      details[open] > summary .chev { transform: rotate(90deg); }
+      .chev { transition: transform 120ms ease; }
+      .pulse-dot::before {
+        content: "";
+        display: inline-block;
+        width: 0.5rem;
+        height: 0.5rem;
+        border-radius: 9999px;
+        background: currentColor;
+        margin-right: 0.4rem;
+        animation: pulse 1.4s ease-in-out infinite;
+        vertical-align: middle;
+      }
+      @keyframes pulse { 0%,100% { opacity: 1 } 50% { opacity: 0.3 } }
+    </style>
+  </head>
+  <body class="bg-slate-950 text-slate-100 font-sans antialiased min-h-screen">
+    <header class="sticky top-0 z-20 bg-slate-900/95 backdrop-blur border-b border-slate-800">
+      <div class="max-w-5xl mx-auto px-4 py-3 flex items-center gap-3 flex-wrap">
+        <div class="flex-1 min-w-0">
+          <h1 class="text-lg sm:text-xl font-bold tracking-tight">KJE CC Session Status</h1>
+          <div class="text-xs text-slate-400 mt-0.5">
+            <span id="refreshed-at">Loading...</span>
+            <span class="mx-1">&middot;</span>
+            <span>next in <span id="countdown">30</span>s</span>
+            <span id="error-badge" class="hidden ml-2 text-rose-400">retrying</span>
+          </div>
+        </div>
+        <button id="pause-btn" class="px-3 py-1.5 text-xs rounded-md border border-slate-700 hover:bg-slate-800">Pause</button>
+        <button id="refresh-btn" class="px-3 py-1.5 text-xs rounded-md bg-blue-600 hover:bg-blue-500 font-medium">Refresh</button>
+      </div>
+    </header>
+
+    <main class="max-w-5xl mx-auto px-4 py-4 space-y-6">
+      <section>
+        <h2 class="text-xs uppercase tracking-wider text-slate-400 mb-2 font-semibold">Active Sessions</h2>
+        <div id="active-list" class="space-y-2">
+          <div class="h-20 rounded-lg skeleton"></div>
+        </div>
+        <div id="active-empty" class="hidden text-sm text-slate-500 italic py-2">No active sessions right now.</div>
+      </section>
+
+      <section>
+        <h2 class="text-xs uppercase tracking-wider text-slate-400 mb-2 font-semibold">Completed (last 24h)</h2>
+        <div id="completed-list" class="space-y-2"></div>
+        <div id="completed-empty" class="hidden text-sm text-slate-500 italic py-2">No completed sessions in the last 24h.</div>
+      </section>
+
+      <footer class="text-xs text-slate-600 pt-4 pb-8 text-center">
+        <a href="https://github.com/jharriGH/kje-cc-status" class="underline hover:text-slate-400">kje-cc-status</a>
+        &middot; Brain proxy via CF Pages Functions &middot; auto-refresh 30s
+      </footer>
+    </main>
+
+    <script>
+      const STATUS_STYLES = {
+        RUNNING: { badge: "bg-blue-500/20 text-blue-300 border border-blue-500/40", label: "running", section: "active", pulse: true },
+        UNKNOWN: { badge: "bg-slate-500/20 text-slate-300 border border-slate-500/40", label: "unknown", section: "active", pulse: false },
+        PASS:    { badge: "bg-emerald-500/20 text-emerald-300 border border-emerald-500/40", label: "PASS", section: "completed", pulse: false },
+        FAIL:    { badge: "bg-rose-500/20 text-rose-300 border border-rose-500/40", label: "FAIL", section: "completed", pulse: false },
+      };
+      const REFRESH_MS = 30000;
+      let paused = false;
+      let countdown = REFRESH_MS / 1000;
+      let lastSuccess = null;
+      const openSessions = new Set();
+      const sessionCache = new Map();
+
+      function elapsedHuman(ts) {
+        if (!ts) return "unknown";
+        const ms = Date.now() - new Date(ts).getTime();
+        if (ms < 0) return "just now";
+        const s = Math.floor(ms / 1000);
+        if (s < 60) return s + "s ago";
+        const m = Math.floor(s / 60);
+        if (m < 60) return m + "m ago";
+        const h = Math.floor(m / 60);
+        if (h < 24) return h + "h " + (m % 60) + "m ago";
+        return Math.floor(h / 24) + "d ago";
+      }
+
+      function escapeHtml(s) {
+        return String(s == null ? "" : s)
+          .replace(/&/g, "&amp;")
+          .replace(/</g, "&lt;")
+          .replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;")
+          .replace(/'/g, "&#39;");
+      }
+
+      function statusOf(s) {
+        const guess = (s.status_guess || "").toUpperCase();
+        if (STATUS_STYLES[guess]) return guess;
+        return "UNKNOWN";
+      }
+
+      function renderCard(s) {
+        const status = statusOf(s);
+        const style = STATUS_STYLES[status];
+        const opened = openSessions.has(s.session_id);
+        const phase = s.latest_phase_tag ? `<span class="text-xs text-slate-400">${escapeHtml(s.latest_phase_tag)}</span>` : "";
+        return `
+        <details class="bg-slate-900 rounded-lg border border-slate-800 overflow-hidden" data-session="${escapeHtml(s.session_id)}" ${opened ? "open" : ""}>
+          <summary class="cursor-pointer px-4 py-3 list-none flex items-start gap-3">
+            <span class="chev text-slate-500 mt-1">&#9656;</span>
+            <div class="flex-1 min-w-0">
+              <div class="flex items-center gap-2 flex-wrap">
+                <span class="px-2 py-0.5 text-xs rounded ${style.badge} ${style.pulse ? "pulse-dot" : ""}">${style.label}</span>
+                <span class="font-mono text-sm font-semibold truncate">${escapeHtml(s.label || s.session_id)}</span>
+                ${phase}
+              </div>
+              <div class="text-xs text-slate-500 mt-1 truncate">
+                <span class="font-mono">${escapeHtml(s.session_id)}</span>
+                &middot; ${escapeHtml(s.project || "general")}
+                &middot; ${escapeHtml(s.entry_count)} entries
+                &middot; <span class="text-slate-400">${escapeHtml(elapsedHuman(s.latest_timestamp))}</span>
+              </div>
+              <div class="text-sm text-slate-300 mt-2 line-clamp-2 whitespace-pre-wrap break-words">${escapeHtml((s.latest_content_preview || "").slice(0, 200))}</div>
+            </div>
+          </summary>
+          <div class="border-t border-slate-800 bg-slate-950/40 px-4 py-3" data-timeline></div>
+        </details>`;
+      }
+
+      async function loadSessionDetail(sessionId, container) {
+        container.innerHTML = `<div class="text-xs text-slate-500">Loading timeline...</div>`;
+        try {
+          const r = await fetch(`/api/session/${encodeURIComponent(sessionId)}`, { cache: "no-store" });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+          sessionCache.set(sessionId, j);
+          renderTimeline(j, container);
+        } catch (err) {
+          container.innerHTML = `<div class="text-xs text-rose-400">Failed to load: ${escapeHtml(err.message || err)}</div>`;
+        }
+      }
+
+      function renderTimeline(j, container) {
+        if (!j.entries || j.entries.length === 0) {
+          container.innerHTML = `<div class="text-xs text-slate-500 italic">No entries returned. Brain may have rotated logs beyond the search window.</div>`;
+          return;
+        }
+        const rows = j.entries.map((e) => {
+          const ts = new Date(e.logged_at).toLocaleString();
+          const tags = (e.tags || []).map((t) => `<span class="text-[10px] px-1 py-0.5 rounded bg-slate-800 text-slate-400 font-mono">${escapeHtml(t)}</span>`).join(" ");
+          return `
+          <div class="py-2 border-b border-slate-800/60 last:border-b-0">
+            <div class="text-[11px] text-slate-500 flex items-center gap-2 flex-wrap">
+              <span class="font-mono">${escapeHtml(ts)}</span>
+              <span>&middot;</span>
+              <span class="font-mono">${escapeHtml(e.agent || "unknown")}</span>
+            </div>
+            <div class="text-sm text-slate-200 mt-1 whitespace-pre-wrap break-words">${escapeHtml(e.content || "")}</div>
+            <div class="mt-1 flex flex-wrap gap-1">${tags}</div>
+          </div>`;
+        }).join("");
+        container.innerHTML = `<div class="text-[11px] text-slate-500 mb-2">${j.count} entries (oldest first)</div>${rows}`;
+      }
+
+      function attachDetailToggles(root) {
+        root.querySelectorAll("details[data-session]").forEach((d) => {
+          d.addEventListener("toggle", (e) => {
+            const sid = d.dataset.session;
+            if (d.open) {
+              openSessions.add(sid);
+              const container = d.querySelector("[data-timeline]");
+              if (container && !container.dataset.loaded) {
+                container.dataset.loaded = "1";
+                loadSessionDetail(sid, container);
+              }
+            } else {
+              openSessions.delete(sid);
+            }
+          });
+        });
+      }
+
+      async function refresh() {
+        const errBadge = document.getElementById("error-badge");
+        try {
+          const r = await fetch("/api/sessions", { cache: "no-store" });
+          const j = await r.json();
+          if (!r.ok) throw new Error(j.error || `HTTP ${r.status}`);
+          lastSuccess = new Date();
+          errBadge.classList.add("hidden");
+          render(j.sessions || []);
+          document.getElementById("refreshed-at").textContent = "Refreshed " + lastSuccess.toLocaleTimeString();
+        } catch (err) {
+          errBadge.classList.remove("hidden");
+          errBadge.textContent = "error: " + (err.message || err).slice(0, 60);
+          const r = document.getElementById("refreshed-at");
+          r.textContent = (lastSuccess ? "Last good " + lastSuccess.toLocaleTimeString() : "Never loaded") + " (retry pending)";
+        }
+      }
+
+      function render(sessions) {
+        const active = sessions.filter((s) => ["RUNNING", "UNKNOWN"].includes(statusOf(s)));
+        const completed = sessions.filter((s) => ["PASS", "FAIL"].includes(statusOf(s)));
+        const al = document.getElementById("active-list");
+        const cl = document.getElementById("completed-list");
+        al.innerHTML = active.map(renderCard).join("") || "";
+        cl.innerHTML = completed.map(renderCard).join("") || "";
+        document.getElementById("active-empty").classList.toggle("hidden", active.length > 0);
+        document.getElementById("completed-empty").classList.toggle("hidden", completed.length > 0);
+        attachDetailToggles(al);
+        attachDetailToggles(cl);
+        for (const sid of openSessions) {
+          const el = document.querySelector(`details[data-session="${CSS.escape(sid)}"]`);
+          if (el) {
+            const container = el.querySelector("[data-timeline]");
+            if (container && container.dataset.loaded) {
+              loadSessionDetail(sid, container);
+            }
+          }
+        }
+      }
+
+      function tick() {
+        if (paused) return;
+        countdown -= 1;
+        document.getElementById("countdown").textContent = Math.max(countdown, 0);
+        if (countdown <= 0) {
+          countdown = REFRESH_MS / 1000;
+          refresh();
+        }
+      }
+
+      document.getElementById("refresh-btn").addEventListener("click", () => {
+        countdown = REFRESH_MS / 1000;
+        refresh();
+      });
+      document.getElementById("pause-btn").addEventListener("click", (e) => {
+        paused = !paused;
+        e.target.textContent = paused ? "Resume" : "Pause";
+        e.target.classList.toggle("bg-amber-600", paused);
+        e.target.classList.toggle("border-slate-700", !paused);
+      });
+
+      refresh();
+      setInterval(tick, 1000);
+    </script>
+  </body>
+</html>
